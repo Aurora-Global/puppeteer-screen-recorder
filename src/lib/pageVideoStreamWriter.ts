@@ -12,9 +12,6 @@ import {
   VideoOptions,
 } from './pageVideoStreamTypes';
 
-/**
- * @ignore
- */
 const SUPPORTED_FILE_FORMATS = [
   SupportedFileFormats.MP4,
   SupportedFileFormats.AVI,
@@ -22,9 +19,6 @@ const SUPPORTED_FILE_FORMATS = [
   SupportedFileFormats.WEBM,
 ];
 
-/**
- * @ignore
- */
 export default class PageVideoStreamWriter extends EventEmitter {
   private readonly screenLimit = 10;
   private screenCastFrames = [];
@@ -37,6 +31,7 @@ export default class PageVideoStreamWriter extends EventEmitter {
 
   private videoMediatorStream: PassThrough = new PassThrough();
   private writerPromise: Promise<boolean>;
+  private destinationExt: SupportedFileFormats | null = null;
 
   constructor(destinationSource: string | Writable, options?: VideoOptions) {
     super();
@@ -47,6 +42,11 @@ export default class PageVideoStreamWriter extends EventEmitter {
 
     const isWritable = this.isWritableStream(destinationSource);
     this.configureFFmPegPath();
+
+    if (!isWritable && typeof destinationSource === 'string') {
+      this.destinationExt = this.getDestinationPathExtension(destinationSource);
+    }
+
     if (isWritable) {
       this.configureVideoWritableStream(destinationSource as Writable);
     } else {
@@ -56,31 +56,20 @@ export default class PageVideoStreamWriter extends EventEmitter {
 
   private get videoFrameSize(): string {
     const { width, height } = this.options.videoFrame;
-
     return width !== null && height !== null ? `${width}x${height}` : '100%';
   }
 
   private get autopad(): { activation: boolean; color?: string } {
     const autopad = this.options.autopad;
-
-    return !autopad
-      ? { activation: false }
-      : { activation: true, color: autopad.color };
+    return !autopad ? { activation: false } : { activation: true, color: autopad.color };
   }
 
   private getFfmpegPath(): string | null {
-    if (this.options.ffmpeg_Path) {
-      return this.options.ffmpeg_Path;
-    }
-
+    if (this.options.ffmpeg_Path) return this.options.ffmpeg_Path;
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
       const ffmpeg = require('@ffmpeg-installer/ffmpeg');
-      if (ffmpeg.path) {
-        return ffmpeg.path;
-      }
-      return null;
-    } catch (e) {
+      return ffmpeg.path || null;
+    } catch {
       return null;
     }
   }
@@ -94,32 +83,18 @@ export default class PageVideoStreamWriter extends EventEmitter {
 
   private configureFFmPegPath(): void {
     const ffmpegPath = this.getFfmpegPath();
-
     if (!ffmpegPath) {
-      throw new Error(
-        'FFmpeg path is missing, \n Set the FFMPEG_PATH env variable',
-      );
+      throw new Error('FFmpeg path is missing, \n Set the FFMPEG_PATH env variable');
     }
-
     setFfmpegPath(ffmpegPath);
   }
 
   private isWritableStream(destinationSource: string | Writable): boolean {
-    if (destinationSource && typeof destinationSource !== 'string') {
-      if (
-        !(destinationSource instanceof Writable) ||
-        !('writable' in destinationSource) ||
-        !destinationSource.writable
-      ) {
-        throw new Error('Output should be a writable stream');
-      }
-      return true;
-    }
-    return false;
+    return destinationSource && typeof destinationSource !== 'string';
   }
 
   private configureVideoFile(destinationPath: string): void {
-    const fileExt = this.getDestinationPathExtension(destinationPath);
+    const fileExt = this.destinationExt;
 
     if (!SUPPORTED_FILE_FORMATS.includes(fileExt)) {
       throw new Error('File format is not supported');
@@ -137,19 +112,29 @@ export default class PageVideoStreamWriter extends EventEmitter {
           this.handleWriteStreamError(e);
           resolve(false);
         })
-        .on('end', () => resolve(true))
-        .save(destinationPath);
+        .on('end', () => resolve(true));
 
-      if (fileExt == SupportedFileFormats.WEBM) {
+      if (fileExt === SupportedFileFormats.WEBM) {
         outputStream
-          .videoCodec('libvpx')
+          .videoCodec('libvpx-vp9')
           .videoBitrate(this.options.videoBitrate || 1000, true)
-          .outputOptions('-flags', '+global_header', '-psnr');
+          .format('webm')
+          .outputOptions([
+            '-deadline', 'realtime',
+            '-cpu-used', '4',
+            `-crf`, `${this.options.videoCrf ?? 32}`,
+          ]);
+      } else {
+        outputStream.format(fileExt);
       }
+
+      outputStream.save(destinationPath);
     });
   }
 
   private configureVideoWritableStream(writableStream: Writable) {
+    const isWebm = this.options.videoCodec?.toLowerCase().includes('vp9') || false;
+
     this.writerPromise = new Promise((resolve) => {
       const outputStream = this.getDestinationStream();
 
@@ -167,10 +152,22 @@ export default class PageVideoStreamWriter extends EventEmitter {
           resolve(true);
         });
 
-      outputStream.toFormat('mp4');
-      outputStream.addOutputOptions(
-        '-movflags +frag_keyframe+separate_moof+omit_tfhd_offset+empty_moov',
-      );
+      if (isWebm) {
+        outputStream
+          .format('webm')
+          .videoCodec('libvpx-vp9')
+          .videoBitrate(this.options.videoBitrate || 1000, true)
+          .outputOptions([
+            '-deadline', 'realtime',
+            '-cpu-used', '4',
+            `-crf`, `${this.options.videoCrf ?? 32}`,
+          ]);
+      } else {
+        outputStream
+          .format('mp4')
+          .addOutputOptions('-movflags +frag_keyframe+separate_moof+omit_tfhd_offset+empty_moov');
+      }
+
       outputStream.pipe(writableStream);
     });
   }
@@ -179,28 +176,23 @@ export default class PageVideoStreamWriter extends EventEmitter {
     const cpu = Math.max(1, os.cpus().length - 1);
     const videoOutputOptions = this.options.videOutputOptions ?? [];
 
-    const outputOptions = [];
-    outputOptions.push(`-crf ${this.options.videoCrf ?? 23}`);
-    outputOptions.push(`-preset ${this.options.videoPreset || 'ultrafast'}`);
-    outputOptions.push(
+    const outputOptions = [
+      `-crf ${this.options.videoCrf ?? 23}`,
+      `-preset ${this.options.videoPreset || 'ultrafast'}`,
       `-pix_fmt ${this.options.videoPixelFormat || 'yuv420p'}`,
-    );
-    outputOptions.push(`-minrate ${this.options.videoBitrate || 1000}`);
-    outputOptions.push(`-maxrate ${this.options.videoBitrate || 1000}`);
-    outputOptions.push('-framerate 1');
-    outputOptions.push(`-threads ${cpu}`);
-    outputOptions.push(`-loglevel error`);
-
-    videoOutputOptions.forEach((options) => {
-      outputOptions.push(options);
-    });
+      `-minrate ${this.options.videoBitrate || 1000}`,
+      `-maxrate ${this.options.videoBitrate || 1000}`,
+      '-framerate 1',
+      `-threads ${cpu}`,
+      '-loglevel error',
+      ...videoOutputOptions,
+    ];
 
     return outputOptions;
   }
 
   private addVideoMetadata(outputStream: ReturnType<typeof ffmpeg>) {
     const metadataOptions = this.options.metadata ?? [];
-
     for (const metadata of metadataOptions) {
       outputStream.outputOptions('-metadata', metadata);
     }
@@ -233,53 +225,35 @@ export default class PageVideoStreamWriter extends EventEmitter {
 
   private handleWriteStreamError(errorMessage): void {
     this.emit('videoStreamWriterError', errorMessage);
-
     if (
       this.status !== VIDEO_WRITE_STATUS.IN_PROGRESS &&
       errorMessage.includes('pipe:0: End of file')
-    ) {
-      return;
-    }
-    return console.error(
-      `Error unable to capture video stream: ${errorMessage}`,
-    );
+    ) return;
+    console.error(`Error unable to capture video stream: ${errorMessage}`);
   }
 
   private findSlot(timestamp: number): number {
-    if (this.screenCastFrames.length === 0) {
-      return 0;
-    }
+    if (this.screenCastFrames.length === 0) return 0;
 
     let i: number;
     let frame: pageScreenFrame;
 
     for (i = this.screenCastFrames.length - 1; i >= 0; i--) {
       frame = this.screenCastFrames[i];
-
-      if (timestamp > frame.timestamp) {
-        break;
-      }
+      if (timestamp > frame.timestamp) break;
     }
 
     return i + 1;
   }
 
   public insert(frame: pageScreenFrame): void {
-    // reduce the queue into half when it is full
     if (this.screenCastFrames.length === this.screenLimit) {
       const numberOfFramesToSplice = Math.floor(this.screenLimit / 2);
-      const framesToProcess = this.screenCastFrames.splice(
-        0,
-        numberOfFramesToSplice,
-      );
-      this.processFrameBeforeWrite(
-        framesToProcess,
-        this.screenCastFrames[0].timestamp,
-      );
+      const framesToProcess = this.screenCastFrames.splice(0, numberOfFramesToSplice);
+      this.processFrameBeforeWrite(framesToProcess, this.screenCastFrames[0].timestamp);
     }
 
     const insertionIndex = this.findSlot(frame.timestamp);
-
     if (insertionIndex === this.screenCastFrames.length) {
       this.screenCastFrames.push(frame);
     } else {
@@ -287,30 +261,15 @@ export default class PageVideoStreamWriter extends EventEmitter {
     }
   }
 
-  private trimFrame(
-    fameList: pageScreenFrame[],
-    chunckEndTime: number,
-  ): pageScreenFrame[] {
-    return fameList.map((currentFrame: pageScreenFrame, index: number) => {
-      const endTime =
-        index !== fameList.length - 1
-          ? fameList[index + 1].timestamp
-          : chunckEndTime;
-      const duration = endTime - currentFrame.timestamp;
-
-      return {
-        ...currentFrame,
-        duration,
-      };
+  private trimFrame(fameList: pageScreenFrame[], chunkEndTime: number): pageScreenFrame[] {
+    return fameList.map((currentFrame, index) => {
+      const endTime = index !== fameList.length - 1 ? fameList[index + 1].timestamp : chunkEndTime;
+      return { ...currentFrame, duration: endTime - currentFrame.timestamp };
     });
   }
 
-  private processFrameBeforeWrite(
-    frames: pageScreenFrame[],
-    chunckEndTime: number,
-  ): void {
-    const processedFrames = this.trimFrame(frames, chunckEndTime);
-
+  private processFrameBeforeWrite(frames: pageScreenFrame[], chunkEndTime: number): void {
+    const processedFrames = this.trimFrame(frames, chunkEndTime);
     processedFrames.forEach(({ blob, duration }) => {
       this.write(blob, duration);
     });
@@ -318,22 +277,18 @@ export default class PageVideoStreamWriter extends EventEmitter {
 
   public write(data: Buffer, durationSeconds = 1): void {
     this.status = VIDEO_WRITE_STATUS.IN_PROGRESS;
-
     const totalFrames = durationSeconds * this.options.fps;
     const floored = Math.floor(totalFrames);
 
     let numberOfFPS = Math.max(floored, 1);
-    if (floored === 0) {
-      this.frameGain += 1 - totalFrames;
-    } else {
-      this.frameLoss += totalFrames - floored;
-    }
+    if (floored === 0) this.frameGain += 1 - totalFrames;
+    else this.frameLoss += totalFrames - floored;
 
-    while (1 < this.frameLoss) {
+    while (this.frameLoss > 1) {
       this.frameLoss--;
       numberOfFPS++;
     }
-    while (1 < this.frameGain) {
+    while (this.frameGain > 1) {
       this.frameGain--;
       numberOfFPS--;
     }
@@ -349,12 +304,9 @@ export default class PageVideoStreamWriter extends EventEmitter {
   }
 
   public stop(stoppedTime = Date.now() / 1000): Promise<boolean> {
-    if (this.status === VIDEO_WRITE_STATUS.COMPLETED) {
-      return this.writerPromise;
-    }
+    if (this.status === VIDEO_WRITE_STATUS.COMPLETED) return this.writerPromise;
 
     this.drainFrames(stoppedTime);
-
     this.videoMediatorStream.end();
     this.status = VIDEO_WRITE_STATUS.COMPLETED;
     return this.writerPromise;
